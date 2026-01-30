@@ -144,6 +144,9 @@ void UntrackSocket(SOCKET s) { /* No-op */ }
 void UntrackSocketByIndex(int idx) { /* No-op */ }
 void CloseAllActiveSockets() { /* No-op */ }
 
+// [New] Routing Rule Stub
+void ReloadRoutingRules(void) { /* No-op */ }
+
 // ThreadPool Stub
 void ThreadPool_Init(int max_workers) { /* No-op */ }
 BOOL ThreadPool_Submit(void (*func)(void*), void* arg, void (*cleanup)(void*)) { 
