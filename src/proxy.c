@@ -1,4 +1,5 @@
 /* src/proxy.c */
+#include <winsock2.h> // [Fix] Must include before windows.h
 #include <windows.h>
 #include <process.h>
 #include "proxy.h"
@@ -13,8 +14,8 @@
 // 本文件现在负责监控核心进程状态，并在节点切换时重载配置。
 // =========================================================================================
 
-// 线程句柄
-static HANDLE hProxyThread = NULL;
+// [Fix] hProxyThread 已在 globals.c 中定义，在 common.h 中声明为 extern
+// static HANDLE hProxyThread = NULL; // Removed
 
 // 状态记录
 static int g_last_node_id = -1;
@@ -143,9 +144,7 @@ void UntrackSocket(SOCKET s) { /* No-op */ }
 void UntrackSocketByIndex(int idx) { /* No-op */ }
 void CloseAllActiveSockets() { /* No-op */ }
 
-// 如果 ThreadPool 相关函数是全局可见的，也需要 Stub
-// 根据原代码，ThreadPool 相关函数似乎是 proxy.c 内部使用的，或者定义在其他地方？
-// 原代码中 ThreadPool_Init 等函数没有 static 修饰，可能是全局的。
+// ThreadPool Stub
 void ThreadPool_Init(int max_workers) { /* No-op */ }
 BOOL ThreadPool_Submit(void (*func)(void*), void* arg, void (*cleanup)(void*)) { 
     // 直接执行清理，避免内存泄漏
