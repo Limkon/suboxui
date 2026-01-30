@@ -1,0 +1,93 @@
+name: OpenSSL Windows Manual Build
+on:
+  workflow_dispatch:
+
+jobs:
+  # --- 任务 1：OpenSSL 编译 (保持不变) ---
+  build-openssl:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          cache: true
+          install: git
+          path-type: minimal
+
+      - name: Install Dependencies
+        shell: msys2 {0}
+        run: |
+          sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
+          pacman -Sy --noconfirm mingw-w64-x86_64-gcc mingw-w64-x86_64-make
+
+      - name: Cache OpenSSL
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: openssl_dist
+          key: openssl-ech-${{ runner.os }}-v1
+
+      - name: Building OpenSSL (This will only run once)
+        shell: msys2 {0}
+        if: steps.cache-openssl.outputs.cache-hit != 'true'
+        run: |
+          echo "Building OpenSSL (This will only run once)..."
+          git clone --depth 1 https://github.com/defo-project/openssl.git openssl-ech
+          cd openssl-ech
+          ./Configure mingw64 no-shared enable-ech --prefix=${GITHUB_WORKSPACE}/openssl_dist
+          sed -i 's/typedef __int64 ossl_ssize_t;/typedef long long ossl_ssize_t;/g' include/openssl/e_os2.h
+          mingw32-make -j8
+          mingw32-make install_sw
+
+  # --- 任务 2：Mandala 主程序 (关键修改) ---
+  build-app:
+    needs: build-openssl
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          cache: true
+          install: git
+          path-type: minimal
+
+      # [修改 1] 安装 cmake 工具
+      - name: Install Build Tools & NGHTTP2
+        shell: msys2 {0}
+        run: |
+          sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
+          pacman -Sy --noconfirm mingw-w64-x86_64-gcc mingw-w64-x86_64-make mingw-w64-x86_64-nghttp2 mingw-w64-x86_64-cmake
+
+      - name: Restore OpenSSL Cache
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: openssl_dist
+          key: openssl-ech-${{ runner.os }}-v1
+
+      # [修改 2] 删除原来的 "Compile Resources" 和 "Compile Executable"
+      # 改用 CMake 构建，它会自动找到 resources/resource.rc
+      - name: Build with CMake
+        shell: msys2 {0}
+        run: |
+          mkdir build
+          cd build
+          cmake -G "MinGW Makefiles" -DOPENSSL_ROOT_DIR="${GITHUB_WORKSPACE}/openssl_dist" -DCMAKE_BUILD_TYPE=Release ..
+          mingw32-make -j4
+
+      # [修改 3] 上传路径改为 build/Mandala.exe
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mandala-Windows-x64-ECH
+          path: build/Mandala.exe

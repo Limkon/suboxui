@@ -1,0 +1,115 @@
+name: Mandala Build (x86 & x64)
+on:
+  workflow_dispatch:
+
+jobs:
+  # --- 任务 1：并行编译 OpenSSL ---
+  build-openssl:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        # 定义两种架构：mingw64 (64位) 和 mingw32 (32位)
+        include:
+          - arch: mingw64
+            msystem: MINGW64
+            openssl_conf: mingw64
+          - arch: mingw32
+            msystem: MINGW32
+            openssl_conf: mingw
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: false
+          cache: true
+          install: git
+          path-type: minimal
+
+      - name: Install GCC & Make
+        shell: msys2 {0}
+        run: |
+          sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
+          if [ "${{ matrix.arch }}" = "mingw64" ]; then
+            pacman -Sy --noconfirm mingw-w64-x86_64-gcc mingw-w64-x86_64-make
+          else
+            pacman -Sy --noconfirm mingw-w64-i686-gcc mingw-w64-i686-make
+          fi
+
+      - name: Cache OpenSSL
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: openssl_dist_${{ matrix.arch }}
+          key: openssl-ech-${{ matrix.arch }}-v1
+
+      - name: Building OpenSSL
+        shell: msys2 {0}
+        if: steps.cache-openssl.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/defo-project/openssl.git openssl-ech
+          cd openssl-ech
+          ./Configure ${{ matrix.openssl_conf }} no-shared enable-ech --prefix=${GITHUB_WORKSPACE}/openssl_dist_${{ matrix.arch }}
+          # 修复 MinGW 编译中的类型定义问题
+          sed -i 's/typedef __int64 ossl_ssize_t;/typedef long long ossl_ssize_t;/g' include/openssl/e_os2.h
+          mingw32-make -j8
+          mingw32-make install_sw
+
+  # --- 任务 2：并行编译 Mandala 主程序 ---
+  build-app:
+    needs: build-openssl
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - arch: mingw64
+            msystem: MINGW64
+            pkg_prefix: mingw-w64-x86_64
+            out_name: Mandala-x64
+          - arch: mingw32
+            msystem: MINGW32
+            pkg_prefix: mingw-w64-i686
+            out_name: Mandala-x86
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: false
+          cache: true
+          install: git
+          path-type: minimal
+
+      - name: Install Build Tools & NGHTTP2
+        shell: msys2 {0}
+        run: |
+          sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
+          pacman -Sy --noconfirm ${{ matrix.pkg_prefix }}-gcc ${{ matrix.pkg_prefix }}-make ${{ matrix.pkg_prefix }}-nghttp2 ${{ matrix.pkg_prefix }}-cmake
+
+      - name: Restore OpenSSL Cache
+        uses: actions/cache@v4
+        with:
+          path: openssl_dist_${{ matrix.arch }}
+          key: openssl-ech-${{ matrix.arch }}-v1
+
+      - name: Build with CMake
+        shell: msys2 {0}
+        run: |
+          mkdir build
+          cd build
+          # 自动指向对应架构的 OpenSSL 目录
+          cmake -G "MinGW Makefiles" -DOPENSSL_ROOT_DIR="${GITHUB_WORKSPACE}/openssl_dist_${{ matrix.arch }}" -DCMAKE_BUILD_TYPE=Release ..
+          mingw32-make -j4
+          mv Mandala.exe ${{ matrix.out_name }}.exe
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.out_name }}-ECH
+          path: build/${{ matrix.out_name }}.exe
