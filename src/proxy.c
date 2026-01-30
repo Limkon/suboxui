@@ -1,589 +1,155 @@
 /* src/proxy.c */
+#include <windows.h>
+#include <process.h>
 #include "proxy.h"
-#include "proxy_internal.h"
+#include "driver_singbox.h" // 引入驱动层接口
+#include "config.h"         // 引入全局配置与节点定义
 #include "utils.h"
-#include "config.h" 
 #include "common.h"
-#include <openssl/rand.h>
-#include <process.h> // for _beginthreadex
-#include <errno.h>
 
 // =========================================================================================
-// [Architecture Fix] 线程池与并发控制子系统
-// 目的: 解决高并发下的"线程爆炸"和 OOM 问题，通过复用线程和限制栈大小提升稳定性。
+// [Refactor] Sing-box 外壳驱动逻辑
+// 原有的 TCP/TLS/WS 转发逻辑已被移除，转而由独立的 Sing-box 进程处理流量。
+// 本文件现在负责监控核心进程状态，并在节点切换时重载配置。
 // =========================================================================================
 
-// [Config] 优化栈大小至 128KB，OpenSSL 调用链通常不需要 512KB，降低内存占用防止 OOM
-// 原值: 512 * 1024 -> 新值: 128 * 1024
-#define THREAD_POOL_STACK_SIZE (128 * 1024) 
+// 线程句柄
+static HANDLE hProxyThread = NULL;
 
-// [Config] 线程池最大容量跟随最大连接数
-#define POOL_MAX_WORKERS MAX_CONNECTIONS   
-// [Safety Fix] 任务队列最大深度，防止 OOM (例如最大连接数的 2 倍)
-#define MAX_PENDING_TASKS (MAX_CONNECTIONS * 2)
+// 状态记录
+static int g_last_node_id = -1;
 
-// --- 活跃 Socket 追踪器 (用于强制中断) ---
-static SOCKET g_active_sockets[MAX_CONNECTIONS];
-static CRITICAL_SECTION g_socket_lock;
-static volatile BOOL g_sockets_inited = FALSE;
+// [Compatibility] 保留此全局变量以维持 GUI 显示 (0=停止, >0=运行中)
+volatile LONG g_active_connections = 0; 
 
-// [Optimization] 使用轮询索引，避免每次从头遍历数组，减少锁持有时间
-static int g_socket_search_idx = 0;
+// -----------------------------------------------------------------------------------------
+// 核心监控线程
+// -----------------------------------------------------------------------------------------
+unsigned __stdcall ProxyMonitorThread(void* arg) {
+    LOG_INFO("[Proxy] Shell mode started. Monitoring Sing-box core...");
+    
+    // 初始化驱动内部状态
+    singbox_init();
+    
+    // 重置状态记录，确保首次循环能触发启动
+    g_last_node_id = -1;
 
-void InitSocketTracker() {
-    if (!g_sockets_inited) {
-        // [Optimization] 使用自旋锁优化临界区性能 (4000 cycles)
-        InitializeCriticalSectionAndSpinCount(&g_socket_lock, 4000);
+    while (g_proxyRunning) {
+        // 1. 获取当前节点 ID
+        // 注意：g_currentNode 在 globals.c 中定义，在 config.h 中声明
+        int current_id = g_currentNode.id;
         
-        for (int i = 0; i < MAX_CONNECTIONS; i++) g_active_sockets[i] = INVALID_SOCKET;
-        g_sockets_inited = TRUE;
-        g_socket_search_idx = 0;
-    }
-}
-
-// [Optimization] O(1) 追踪：返回索引供快速移除
-int TrackSocket(SOCKET s) {
-    if (s == INVALID_SOCKET) return -1;
-    if (!g_sockets_inited) return -1;
-    
-    int assigned_idx = -1;
-    EnterCriticalSection(&g_socket_lock);
-    
-    // Round-Robin 查找空闲槽位
-    int start_idx = g_socket_search_idx;
-    
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        int curr = (start_idx + i) % MAX_CONNECTIONS;
-        if (g_active_sockets[curr] == INVALID_SOCKET) {
-            g_active_sockets[curr] = s;
-            assigned_idx = curr;
-            g_socket_search_idx = (curr + 1) % MAX_CONNECTIONS;
-            break;
-        }
-    }
-    
-    LeaveCriticalSection(&g_socket_lock);
-    return assigned_idx;
-}
-
-// [Optimization] O(1) 移除：直接通过索引移除
-void UntrackSocketByIndex(int idx) {
-    if (idx < 0 || idx >= MAX_CONNECTIONS) return;
-    if (!g_sockets_inited) return;
-
-    EnterCriticalSection(&g_socket_lock);
-    if (g_active_sockets[idx] != INVALID_SOCKET) {
-        g_active_sockets[idx] = INVALID_SOCKET;
-    }
-    LeaveCriticalSection(&g_socket_lock);
-}
-
-// 为了兼容性保留旧接口
-void UntrackSocket(SOCKET s) {
-    if (s == INVALID_SOCKET) return;
-    if (!g_sockets_inited) return;
-
-    EnterCriticalSection(&g_socket_lock);
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        if (g_active_sockets[i] == s) {
-            g_active_sockets[i] = INVALID_SOCKET;
-            break;
-        }
-    }
-    LeaveCriticalSection(&g_socket_lock);
-}
-
-// [Fix] 仅中断 IO，不关闭句柄，防止 Race Condition
-void CloseAllActiveSockets() {
-    if (!g_sockets_inited) return;
-
-    EnterCriticalSection(&g_socket_lock);
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        SOCKET s = g_active_sockets[i];
-        if (s != INVALID_SOCKET) {
-            // [Critical] 仅 shutdown 唤醒阻塞线程，绝不 closesocket
-            shutdown(s, SD_BOTH);
-        }
-    }
-    LeaveCriticalSection(&g_socket_lock);
-}
-
-void CleanupSocketTracker() {
-    if (g_sockets_inited) {
-        DeleteCriticalSection(&g_socket_lock);
-        g_sockets_inited = FALSE;
-    }
-}
-
-// --- 线程池定义 ---
-
-typedef struct TaskNode {
-    void (*function)(void*);
-    void* argument;
-    void (*cleanup)(void*); // 清理回调
-    struct TaskNode* next;
-} TaskNode;
-
-// 线程池控制结构
-typedef struct {
-    TaskNode* head;
-    TaskNode* tail;
-    CRITICAL_SECTION lock;
-    CONDITION_VARIABLE cond;
-    HANDLE* threads;        
-    int thread_count;       
-    int busy_count;         
-    int pending_count;      // [Safety Fix] 当前排队任务数
-    volatile BOOL running;  
-    int max_workers;        
-} ThreadPool;
-
-static ThreadPool g_pool;
-volatile LONG g_active_connections = 0; // 全局活跃连接计数器
-
-// --- 线程池内部函数 ---
-
-unsigned __stdcall WorkerThreadProc(void* arg) {
-    ThreadPool* pool = (ThreadPool*)arg;
-    
-    while (TRUE) {
-        TaskNode* task = NULL;
-
-        EnterCriticalSection(&pool->lock);
-        // 等待任务或停止信号
-        while (pool->head == NULL && pool->running) {
-            SleepConditionVariableCS(&pool->cond, &pool->lock, INFINITE);
-        }
-
-        if (!pool->running && pool->head == NULL) {
-            LeaveCriticalSection(&pool->lock);
-            break;
-        }
-
-        // 取出任务
-        task = pool->head;
-        if (task) {
-            pool->head = task->next;
-            if (pool->head == NULL) pool->tail = NULL;
-            pool->busy_count++;
-            pool->pending_count--; // [Safety Fix] 减少排队计数
-        }
-        LeaveCriticalSection(&pool->lock);
-
-        if (task) {
-            // 执行任务
-            if (task->function && task->argument) {
-                task->function(task->argument);
-            }
-            
-            free(task);
-            
-            EnterCriticalSection(&pool->lock);
-            pool->busy_count--;
-            LeaveCriticalSection(&pool->lock);
-        }
-    }
-    return 0;
-}
-
-void ThreadPool_Init(int max_workers) {
-    g_pool.head = NULL;
-    g_pool.tail = NULL;
-    g_pool.thread_count = 0;
-    g_pool.busy_count = 0;
-    g_pool.pending_count = 0; // [Safety Fix]
-    g_pool.running = TRUE;
-    g_pool.max_workers = max_workers;
-    
-    g_pool.threads = (HANDLE*)malloc(sizeof(HANDLE) * max_workers);
-    if (g_pool.threads) {
-        memset(g_pool.threads, 0, sizeof(HANDLE) * max_workers);
-    }
-    
-    InitializeCriticalSectionAndSpinCount(&g_pool.lock, 4000);
-    InitializeConditionVariable(&g_pool.cond);
-    InitSocketTracker(); 
-}
-
-// 提交任务 (带队列深度限制)
-BOOL ThreadPool_Submit(void (*func)(void*), void* arg, void (*cleanup)(void*)) {
-    if (!g_pool.running) return FALSE;
-
-    // 1. [Pre-check] 如果队列已满，直接拒绝，避免 malloc 消耗
-    // 这里读 pending_count 是非加锁的近似值，为了性能可接受
-    if (g_pool.pending_count >= MAX_PENDING_TASKS) {
-        LOG_WARN("[ThreadPool] Rejected: Queue full (%d)", g_pool.pending_count);
-        return FALSE;
-    }
-
-    TaskNode* newTask = (TaskNode*)malloc(sizeof(TaskNode));
-    if (!newTask) return FALSE;
-    
-    newTask->function = func;
-    newTask->argument = arg;
-    newTask->cleanup = cleanup;
-    newTask->next = NULL;
-
-    EnterCriticalSection(&g_pool.lock);
-
-    // 2. [Double-check] 加锁后再次检查队列限制
-    if (g_pool.pending_count >= MAX_PENDING_TASKS) {
-        LeaveCriticalSection(&g_pool.lock);
-        free(newTask);
-        LOG_WARN("[ThreadPool] Rejected: Queue limit hit (%d)", MAX_PENDING_TASKS);
-        return FALSE;
-    }
-    
-    TaskNode* oldTail = g_pool.tail;
-
-    if (g_pool.tail) {
-        g_pool.tail->next = newTask;
-        g_pool.tail = newTask;
-    } else {
-        g_pool.head = newTask;
-        g_pool.tail = newTask;
-    }
-    g_pool.pending_count++; // [Safety Fix]
-    
-    // 扩容策略
-    BOOL spawn_needed = (g_pool.busy_count >= g_pool.thread_count && g_pool.thread_count < g_pool.max_workers);
-    if (g_pool.thread_count == 0) spawn_needed = TRUE;
-
-    BOOL submission_success = TRUE;
-
-    if (spawn_needed) {
-        HANDLE hThread = (HANDLE)_beginthreadex(NULL, THREAD_POOL_STACK_SIZE, WorkerThreadProc, &g_pool, 0, NULL);
-        if (hThread) {
-            g_pool.threads[g_pool.thread_count++] = hThread;
-        } else {
-            if (g_pool.thread_count > 0) {
-                 LOG_WARN("[ThreadPool] Failed to expand pool. Task queued.");
-            } else {
-                LOG_ERROR("[ThreadPool] Failed to spawn initial worker.");
-                // 回滚队列
-                if (oldTail) {
-                    oldTail->next = NULL;
-                    g_pool.tail = oldTail;
+        // 2. 检查节点是否变更
+        if (current_id != g_last_node_id) {
+            // 只有当 ID 有效（非 0）时才启动
+            if (current_id != 0) {
+                LOG_INFO("[Proxy] Node switch detected (ID: %d -> %d). Reloading core...", g_last_node_id, current_id);
+                
+                // 调用驱动启动/重启 Sing-box
+                // 这会自动生成 config.json 并重启子进程
+                int ret = singbox_start(&g_currentNode, &global_settings);
+                
+                if (ret == 0) {
+                    LOG_INFO("[Proxy] Core reloaded successfully.");
                 } else {
-                    g_pool.head = NULL;
-                    g_pool.tail = NULL;
+                    LOG_ERROR("[Proxy] Failed to reload core. Error code: %d", ret);
                 }
-                g_pool.pending_count--; // 回滚计数
-                submission_success = FALSE;
-            }
-        }
-    }
-    
-    if (submission_success) {
-        WakeConditionVariable(&g_pool.cond);
-    }
-    
-    LeaveCriticalSection(&g_pool.lock);
-    
-    if (!submission_success) {
-        free(newTask);
-    }
-    
-    return submission_success;
-}
-
-void ThreadPool_Shutdown() {
-    EnterCriticalSection(&g_pool.lock);
-    g_pool.running = FALSE;
-    WakeAllConditionVariable(&g_pool.cond);
-    LeaveCriticalSection(&g_pool.lock);
-
-    if (g_pool.thread_count > 0 && g_pool.threads) {
-        HANDLE wait_buffer[MAXIMUM_WAIT_OBJECTS];
-        int buffer_count = 0;
-        int processed_threads = 0;
-
-        while (processed_threads < g_pool.thread_count) {
-            buffer_count = 0;
-            int start_index = processed_threads;
-            
-            for (int i = 0; i < MAXIMUM_WAIT_OBJECTS && (start_index + i) < g_pool.thread_count; i++) {
-                HANDLE t = g_pool.threads[start_index + i];
-                if (t) wait_buffer[buffer_count++] = t;
-            }
-
-            if (buffer_count > 0) {
-                WaitForMultipleObjects(buffer_count, wait_buffer, TRUE, 5000);
-                for (int k = 0; k < buffer_count; k++) CloseHandle(wait_buffer[k]);
-            }
-            processed_threads += buffer_count;
-        }
-        memset(g_pool.threads, 0, sizeof(HANDLE) * g_pool.max_workers);
-    }
-
-    if (g_pool.threads) {
-        free(g_pool.threads);
-        g_pool.threads = NULL;
-    }
-    DeleteCriticalSection(&g_pool.lock);
-    
-    // 清理未执行的任务
-    TaskNode* cur = g_pool.head;
-    int dropped_tasks = 0;
-    while (cur) {
-        TaskNode* next = cur->next;
-        if (cur->argument && cur->cleanup) {
-            cur->cleanup(cur->argument);
-            dropped_tasks++;
-        }
-        free(cur);
-        cur = next;
-    }
-    
-    if (dropped_tasks > 0) {
-        LOG_WARN("[ThreadPool] Dropped %d pending tasks.", dropped_tasks);
-    }
-    
-    g_pool.head = NULL;
-    g_pool.tail = NULL;
-    g_pool.pending_count = 0;
-    
-    CleanupSocketTracker();
-}
-
-// =========================================================================================
-// [Core Logic] 客户端处理逻辑
-// =========================================================================================
-
-static void CleanupClientContext(void* arg) {
-    ClientContext* ctx = (ClientContext*)arg;
-    if (ctx) {
-        if (ctx->clientSock != INVALID_SOCKET) {
-            closesocket(ctx->clientSock);
-            ctx->clientSock = INVALID_SOCKET;
-        }
-        free(ctx);
-        InterlockedDecrement(&g_active_connections);
-    }
-}
-
-void client_task_wrapper(void* p) {
-    ClientContext* ctx = (ClientContext*)p;
-    if (!ctx) return;
-    
-    SOCKET cid = ctx->clientSock;
-    int track_idx = TrackSocket(cid);
-    
-    if (track_idx < 0) {
-        LOG_ERROR("[Conn-%d] Socket Tracker Full. Rejecting.", cid);
-        CleanupClientContext(ctx);
-        return;
-    }
-    
-    ProxySession session;
-    if (session_init(&session, ctx) != 0) {
-        LOG_ERROR("[Conn-%d] Session Init Failed", cid);
-        UntrackSocketByIndex(track_idx);
-        CleanupClientContext(ctx); // Use helper for consistency
-        return;
-    }
-    
-    // 执行代理步骤
-    if (step_handshake_browser(&session) == 0) {
-        // [New] 分流 UDP Associate
-        if (session.is_udp_associate) {
-            step_transfer_loop_udp_direct(&session);
-        } 
-        else {
-            // 原有的 TCP/Tunnel 流程
-            if (step_connect_upstream(&session) == 0) {
-                if (step_handshake_ws(&session) == 0) {
-                    if (step_send_proxy_request(&session) == 0) {
-                        if (step_respond_to_browser(&session) == 0) {
-                            if (session.alpn_is_h2) {
-                                step_transfer_loop_h2(&session);
-                            } else {
-                                step_transfer_loop_h1(&session);
-                            }
-                        }
-                    }
+            } else {
+                // 如果切换到了无效节点（例如未选择），则停止核心
+                if (singbox_is_running()) {
+                    LOG_INFO("[Proxy] No node selected. Stopping core.");
+                    singbox_stop();
                 }
             }
+            g_last_node_id = current_id;
         }
-    }
-
-    session_free(&session);
-    UntrackSocketByIndex(track_idx); 
-    
-    if (ctx) free(ctx);
-    InterlockedDecrement(&g_active_connections);
-}
-
-// =========================================================================================
-// [Main Server] 监听线程与管理函数
-// =========================================================================================
-
-DWORD WINAPI server_thread(LPVOID p) {
-    g_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (g_listen_sock == INVALID_SOCKET) {
-        LOG_ERROR("Socket create fail: %d", WSAGetLastError());
-        g_proxyRunning = FALSE;
-        return 0;
-    }
-
-    struct sockaddr_in addr; 
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET; 
-    addr.sin_port = htons(g_localPort);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    
-    int opt = 1; 
-    setsockopt(g_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
-    
-    if (bind(g_listen_sock, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        LOG_ERROR("Port %d bind fail: %d", g_localPort, WSAGetLastError()); 
-        closesocket(g_listen_sock);
-        g_listen_sock = INVALID_SOCKET;
-        g_proxyRunning = FALSE; 
-        return 0;
-    }
-    
-    if (listen(g_listen_sock, SOMAXCONN) == SOCKET_ERROR) {
-        LOG_ERROR("Listen fail: %d", WSAGetLastError());
-        closesocket(g_listen_sock);
-        g_listen_sock = INVALID_SOCKET;
-        g_proxyRunning = FALSE;
-        return 0;
-    }
-
-    LOG_INFO("Server listening on 127.0.0.1:%d", g_localPort);
-    
-    // 初始化线程池
-    ThreadPool_Init(MAX_CONNECTIONS);
-    
-    int accept_fail_count = 0;
-
-    while(g_proxyRunning) {
-        // [Refactor] 路由热重载逻辑
-        // 使用 select 超时机制，确保即使没有新连接也能响应重载信号
-        if (g_needReloadRoutes) {
-            ReloadRoutingRules();
-            g_needReloadRoutes = FALSE;
-            LOG_INFO("Routing rules hot-reloaded.");
-        }
-
-        // 1. 设置 select 监听
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(g_listen_sock, &readfds);
-
-        // 2. 设置超时时间 (200ms)
-        struct timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = 200 * 1000;
-
-        // 3. 等待事件
-        int ret = select(0, &readfds, NULL, NULL, &tv);
-
-        if (ret < 0) {
-            LOG_ERROR("Select failed: %d", WSAGetLastError());
-            break; 
-        }
-
-        if (ret == 0) {
-            // 超时，无新连接，继续循环检查 g_proxyRunning 和 g_needReloadRoutes
-            continue;
-        }
-
-        // 4. 有可读事件，执行 Accept
-        SOCKET c = accept(g_listen_sock, NULL, NULL);
-        if (c == INVALID_SOCKET) {
-            if (!g_proxyRunning) break;
+        
+        // 3. 守护进程逻辑：如果应该运行但未运行，则尝试重启
+        if (g_last_node_id != 0 && !singbox_is_running()) {
+            LOG_WARN("[Proxy] Sing-box core process exited unexpectedly. Restarting...");
             
-            int err = WSAGetLastError();
-            if (err != WSAEWOULDBLOCK && err != WSAEINTR) {
-                accept_fail_count++;
-                if (accept_fail_count > 100) Sleep(100); 
-                else if (accept_fail_count > 10) Sleep(10);
+            int ret = singbox_start(&g_currentNode, &global_settings);
+            if (ret != 0) {
+                LOG_ERROR("[Proxy] Daemon restart failed: %d", ret);
             }
-            continue; 
-        }
-        accept_fail_count = 0;
-
-        long current_conns = InterlockedIncrement(&g_active_connections);
-        if (current_conns > MAX_CONNECTIONS) {
-            LOG_WARN("Max connections limit (%d) exceeded", MAX_CONNECTIONS);
-            InterlockedDecrement(&g_active_connections); 
-            closesocket(c);
-            Sleep(50); 
-            continue;
-        }
-
-        ClientContext* ctx = (ClientContext*)malloc(sizeof(ClientContext));
-        if (ctx) {
-            ctx->clientSock = c;
             
-            EnterCriticalSection(&g_configLock);
-            ctx->config = g_proxyConfig; 
-            strncpy(ctx->userAgent, g_userAgentStr, sizeof(ctx->userAgent)-1);
-            ctx->userAgent[sizeof(ctx->userAgent)-1] = 0;
-            
-            // 复制加密配置...
-            ctx->cryptoSettings.enableFragment = g_enableFragment;
-            ctx->cryptoSettings.fragMin = g_fragSizeMin;
-            ctx->cryptoSettings.fragMax = g_fragSizeMax;
-            ctx->cryptoSettings.fragDelay = g_fragDelayMs;
-            ctx->cryptoSettings.enablePadding = g_enablePadding;
-            ctx->cryptoSettings.padMin = g_padSizeMin;
-            ctx->cryptoSettings.padMax = g_padSizeMax;
-            ctx->cryptoSettings.browserType = g_browserType;
-            strncpy(ctx->cryptoSettings.customCiphers, g_customCiphers, sizeof(ctx->cryptoSettings.customCiphers));
-            ctx->cryptoSettings.alpnOverride = 0;
-            LeaveCriticalSection(&g_configLock);
-
-            // [Safety Fix] 如果提交失败（队列满），调用 CleanupClientContext 进行清理
-            if (!ThreadPool_Submit(client_task_wrapper, ctx, CleanupClientContext)) {
-                // 手动调用清理函数，因为 ThreadPool_Submit 在失败时不会自动调用 arg 的清理函数
-                CleanupClientContext(ctx);
-            }
-        } else {
-            LOG_ERROR("OOM: Failed to allocate ClientContext");
-            InterlockedDecrement(&g_active_connections);
-            closesocket(c);
+            // 避免在持续崩溃时占满 CPU
+            Sleep(2000);
         }
+
+        // 4. 维持心跳，响应 g_proxyRunning 变化
+        Sleep(1000);
     }
-    
-    ThreadPool_Shutdown();
+
+    // 退出循环时，确保停止核心进程
+    singbox_stop();
+    LOG_INFO("[Proxy] Monitor thread exited.");
     return 0;
 }
+
+// -----------------------------------------------------------------------------------------
+// 对外接口
+// -----------------------------------------------------------------------------------------
 
 void StartProxyCore() {
     if (g_proxyRunning) return;
+    
+    LOG_INFO("[Proxy] Starting proxy service (Driver Mode)...");
     g_proxyRunning = TRUE;
-    hProxyThread = CreateThread(NULL, 0, server_thread, NULL, 0, NULL);
+    
+    // 设置虚拟连接数，让 GUI 显示“运行中”状态
+    // 在 Sing-box 模式下无法获取实时连接数，固定为 1 表示服务正常
+    InterlockedExchange(&g_active_connections, 1);
+    
+    // 启动监控线程
+    hProxyThread = (HANDLE)_beginthreadex(NULL, 0, ProxyMonitorThread, NULL, 0, NULL);
+    
     if (!hProxyThread) {
+        LOG_ERROR("[Proxy] Failed to create monitor thread!");
         g_proxyRunning = FALSE;
-        LOG_ERROR("Failed to start server thread");
+        InterlockedExchange(&g_active_connections, 0);
     }
 }
 
 void StopProxyCore() {
-    g_proxyRunning = FALSE;
-    
-    if (g_listen_sock != INVALID_SOCKET) { 
-        closesocket(g_listen_sock); 
-        g_listen_sock = INVALID_SOCKET; 
-        LOG_INFO("Listen socket closed.");
-    }
+    if (!g_proxyRunning) return;
 
-    LOG_INFO("Interrupting active connections...");
-    CloseAllActiveSockets();
+    LOG_INFO("[Proxy] Stopping proxy service...");
+    g_proxyRunning = FALSE; // 通知线程退出
     
-    if (hProxyThread) { 
-        WaitForSingleObject(hProxyThread, 8000); 
-        CloseHandle(hProxyThread); 
-        hProxyThread = NULL; 
+    // 等待监控线程结束
+    if (hProxyThread) {
+        WaitForSingleObject(hProxyThread, 5000); // 最多等待 5 秒
+        CloseHandle(hProxyThread);
+        hProxyThread = NULL;
     }
     
-    if (g_active_connections > 0) {
-        LOG_WARN("Core stopped but %ld connections count remains.", g_active_connections);
-        g_active_connections = 0;
-    }
+    // 再次确保核心被终止 (双重保险)
+    singbox_stop();
     
-    LOG_INFO("Proxy Stopped");
+    InterlockedExchange(&g_active_connections, 0);
+    LOG_INFO("[Proxy] Service stopped.");
 }
+
+// -----------------------------------------------------------------------------------------
+// 僵尸代码桩 (Zombie Stubs)
+// 保留这些空函数以防止链接错误，因为 main.c 或其他模块可能引用了它们。
+// -----------------------------------------------------------------------------------------
+
+void InitSocketTracker() { /* No-op */ }
+void CleanupSocketTracker() { /* No-op */ }
+int TrackSocket(SOCKET s) { return -1; }
+void UntrackSocket(SOCKET s) { /* No-op */ }
+void UntrackSocketByIndex(int idx) { /* No-op */ }
+void CloseAllActiveSockets() { /* No-op */ }
+
+// 如果 ThreadPool 相关函数是全局可见的，也需要 Stub
+// 根据原代码，ThreadPool 相关函数似乎是 proxy.c 内部使用的，或者定义在其他地方？
+// 原代码中 ThreadPool_Init 等函数没有 static 修饰，可能是全局的。
+void ThreadPool_Init(int max_workers) { /* No-op */ }
+BOOL ThreadPool_Submit(void (*func)(void*), void* arg, void (*cleanup)(void*)) { 
+    // 直接执行清理，避免内存泄漏
+    if (cleanup && arg) cleanup(arg);
+    return FALSE; 
+}
+void ThreadPool_Shutdown() { /* No-op */ }
