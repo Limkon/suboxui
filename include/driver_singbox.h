@@ -2,6 +2,7 @@
 #define DRIVER_SINGBOX_H
 
 #include "proxy_types.h"
+#include "config.h" // [Fix] 引入此头文件以识别 node_t 和 program_settings_t
 
 #ifdef __cplusplus
 extern "C" {
