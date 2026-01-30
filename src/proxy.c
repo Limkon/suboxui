@@ -14,9 +14,6 @@
 // 本文件现在负责监控核心进程状态，并在节点切换时重载配置。
 // =========================================================================================
 
-// [Fix] hProxyThread 已在 globals.c 中定义，在 common.h 中声明为 extern
-// static HANDLE hProxyThread = NULL; // Removed
-
 // 状态记录
 static int g_last_node_id = -1;
 
@@ -144,8 +141,8 @@ void UntrackSocket(SOCKET s) { /* No-op */ }
 void UntrackSocketByIndex(int idx) { /* No-op */ }
 void CloseAllActiveSockets() { /* No-op */ }
 
-// [New] Routing Rule Stub
-void ReloadRoutingRules(void) { /* No-op */ }
+// [Fix] ReloadRoutingRules 已在 config_nodes.c 中定义，此处移除
+// void ReloadRoutingRules(void) { } 
 
 // ThreadPool Stub
 void ThreadPool_Init(int max_workers) { /* No-op */ }
