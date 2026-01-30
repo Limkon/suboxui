@@ -1,6 +1,7 @@
 // 文件名: include/config.h
 // [Refactor] 2024: 彻底移除了废弃的 VMess 声明，并增加了新功能接口
 // [Refactor] 2026: 升级浏览器指纹模拟，支持多种浏览器及自定义输入
+// [Refactor] 2026: 增加 Sing-box 核心驱动支持结构体
 
 #ifndef CONFIG_H
 #define CONFIG_H
@@ -9,6 +10,34 @@
 #include "cJSON.h"
 
 // 注意：原有的全局变量 (g_localPort, g_proxyConfig 等) 已在 common.h 中声明
+
+// --- [New] Sing-box 核心驱动支持 ---
+
+// 程序全局设置
+typedef struct {
+    int local_port;           // 本地监听端口 (对应 g_localPort)
+    int allow_lan;            // 允许局域网连接
+    char singbox_path[512];   // Sing-box 核心文件路径
+} program_settings_t;
+
+extern program_settings_t global_settings;
+
+// 节点信息结构体 (用于驱动层生成配置)
+typedef struct {
+    int id;                   // 内部 ID 或索引
+    char address[256];        // 服务器地址
+    int port;                 // 服务器端口
+    int type;                 // 协议类型: 1=VMess, 2=VLESS, 3=Shadowsocks, 4=Trojan
+    char uuid[128];           // UUID 或 密码
+    char host[256];           // SNI / Host
+    char path[256];           // WebSocket Path / gRPC ServiceName
+    char security[64];        // 加密方式 (Shadowsocks/VMess)
+    char flow[64];            // VLESS Flow / XTLS Flow
+    int net_type;             // 传输类型: 0=TCP, 1=WS, 2=gRPC, etc.
+    int tls;                  // TLS 开关: 1=Enabled, 0=Disabled
+} node_t;
+
+extern node_t g_currentNode;  // 当前选中的节点信息 (供驱动层使用)
 
 // --- [New] 浏览器指纹配置 ---
 // 定义浏览器类型枚举
