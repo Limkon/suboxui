@@ -11,8 +11,7 @@
 // 定义控件 ID
 #define ID_COMBO_BROWSER 3001
 #define ID_EDIT_CUSTOM_CIPHERS 3002
-// [Fix] 移除重复定义，resource.h 中已有 ID_EDIT_ADDR (2202)
-// #define ID_EDIT_ADDR 3003 
+#define ID_EDIT_CORE_PATH 3005 // [New] 核心路径输入框 ID
 
 // [Mod] 更新模板数量为 8 (含 Custom)
 #define UA_TEMPLATE_COUNT 8
@@ -29,13 +28,18 @@ DWORD WINAPI SettingsApplyThread(LPVOID lpParam) {
 }
 
 LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    static HWND hHotkey, hPortEdit, hAddrEdit;
+    static HWND hHotkey, hPortEdit, hAddrEdit, hCorePathEdit;
     switch(msg) {
         case WM_CREATE: {
             EnterCriticalSection(&g_configLock);
             int localPort = g_localPort;
             char localAddr[64];
             strcpy(localAddr, g_localAddr);
+            
+            // [New] 读取核心路径
+            char corePath[512];
+            strcpy(corePath, global_settings.singbox_path);
+
             int modifiers = g_hotkeyModifiers;
             int vk = g_hotkeyVk;
             
@@ -76,7 +80,13 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             hPortEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", NULL, WS_CHILD|WS_VISIBLE|ES_NUMBER, 160, y-3, 100, 25, hWnd, (HMENU)ID_PORT_EDIT, NULL,NULL);
             SetDlgItemInt(hWnd, ID_PORT_EDIT, localPort, FALSE);
 
-            // 抗封锁配置 GroupBox
+            // [New] Sing-box 核心路径配置
+            y += 35;
+            CreateWindowW(L"STATIC", L"Sing-box 核心:", WS_CHILD|WS_VISIBLE, 25, y, 140, 20, hWnd, NULL,NULL,NULL);
+            hCorePathEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", NULL, WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL, 160, y-3, 270, 25, hWnd, (HMENU)ID_EDIT_CORE_PATH, NULL,NULL);
+            SetDlgItemTextA(hWnd, ID_EDIT_CORE_PATH, corePath);
+
+            // 抗封锁配置 GroupBox (整体下移)
             y += 50;
             CreateWindowW(L"BUTTON", L"抗封锁策略配置", WS_CHILD|WS_VISIBLE|BS_GROUPBOX, 20, y, 420, 480, hWnd, NULL, NULL, NULL);
             
@@ -150,7 +160,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             y += 30;
             CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 35, y, 365, 25, hWnd, (HMENU)ID_EDIT_UA_STR, NULL, NULL);
 
-            // Buttons
+            // Buttons (整体下移)
             y += 60;
             CreateWindowW(L"BUTTON", L"确定", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 110, y, 100, 32, hWnd, (HMENU)IDOK, NULL,NULL);
             CreateWindowW(L"BUTTON", L"取消", WS_CHILD|WS_VISIBLE, 250, y, 100, 32, hWnd, (HMENU)IDCANCEL, NULL,NULL);
@@ -242,10 +252,18 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
                 g_padSizeMin = pMin; g_padSizeMax = pMax;
                 if (port > 0 && port < 65535) g_localPort = port;
                 
+                // [Sync] 同步到 global_settings
+                global_settings.local_port = g_localPort;
+
                 // [New] 保存代理地址
                 wchar_t wAddr[64] = {0};
                 GetDlgItemTextW(hWnd, ID_EDIT_ADDR, wAddr, 64);
                 WideCharToMultiByte(CP_UTF8, 0, wAddr, -1, g_localAddr, 64, NULL, NULL);
+
+                // [New] 保存 Sing-box 核心路径
+                wchar_t wCorePath[512] = {0};
+                GetDlgItemTextW(hWnd, ID_EDIT_CORE_PATH, wCorePath, 512);
+                WideCharToMultiByte(CP_UTF8, 0, wCorePath, -1, global_settings.singbox_path, 512, NULL, NULL);
 
                 g_browserType = SendMessage(GetDlgItem(hWnd, ID_COMBO_BROWSER), CB_GETCURSEL, 0, 0);
                 
@@ -309,7 +327,7 @@ void OpenSettingsWindow() {
     }
     
     hSettingsWnd = CreateWindowW(L"Settings", L"软件设置", WS_VISIBLE|WS_CAPTION|WS_SYSMENU, 
-        CW_USEDEFAULT, 0, 480, 720, hwnd, NULL, wc.hInstance, NULL);
+        CW_USEDEFAULT, 0, 480, 770, hwnd, NULL, wc.hInstance, NULL); // [Mod] 增加窗口高度以容纳新控件
         
     ShowWindow(hSettingsWnd, SW_SHOW);
 }
