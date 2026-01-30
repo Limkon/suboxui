@@ -3,6 +3,7 @@
 // 包含: LoadSettings, SaveSettings, Globals, Helpers
 // [Refactor] 2026-01-29: 实现原子文件写入 (Write-Replace)，防止配置文件损坏
 // [Fix] 2026-01-29: 增强 JSON 解析容错与备份机制
+// [Refactor] 2026: 增加 Sing-box 核心路径的保存与加载
 
 #include "config.h"
 #include "utils.h"
@@ -93,6 +94,13 @@ static void ApplyJsonConfig(const char* jsonContent) {
         cJSON* jPort = cJSON_GetObjectItem(root, "proxy_port");
         if (cJSON_IsNumber(jPort)) {
             g_localPort = jPort->valueint;
+            global_settings.local_port = jPort->valueint; // [Sync]
+        }
+        
+        // [New] 读取 Sing-box 核心路径
+        cJSON* jSbPath = cJSON_GetObjectItem(root, "singbox_path");
+        if (cJSON_IsString(jSbPath) && (jSbPath->valuestring != NULL)) {
+            ConfigSafeStrCpy(global_settings.singbox_path, sizeof(global_settings.singbox_path), jSbPath->valuestring);
         }
 
         // 读取选中节点
@@ -165,7 +173,8 @@ static void ApplyJsonConfig(const char* jsonContent) {
 }
 
 // [Refactor] 原子写入 JSON 配置 (先写临时文件，再 MoveFile)
-static void WriteJsonConfig(const char* addr, int port, const wchar_t* wNode) {
+// [Mod] 增加 sbPath 参数
+static void WriteJsonConfig(const char* addr, int port, const wchar_t* wNode, const char* sbPath) {
     wchar_t jsonPath[MAX_PATH];
     wchar_t tempPath[MAX_PATH];
     GetJsonConfigPath(jsonPath, MAX_PATH);
@@ -194,6 +203,14 @@ static void WriteJsonConfig(const char* addr, int port, const wchar_t* wNode) {
     
     if (cJSON_GetObjectItem(root, "proxy_port")) cJSON_DeleteItemFromObject(root, "proxy_port");
     cJSON_AddNumberToObject(root, "proxy_port", port);
+
+    // [New] 写入 Sing-box 路径
+    if (cJSON_GetObjectItem(root, "singbox_path")) cJSON_DeleteItemFromObject(root, "singbox_path");
+    if (sbPath && strlen(sbPath) > 0) {
+        cJSON_AddStringToObject(root, "singbox_path", sbPath);
+    } else {
+        cJSON_AddStringToObject(root, "singbox_path", "sing-box.exe");
+    }
 
     // 转换节点名为 UTF-8
     char utf8Node[1024] = {0};
@@ -363,6 +380,12 @@ void LoadSettings() {
         ApplyJsonConfig(jsonContent);
         free(jsonContent); // 释放内存
     }
+    
+    // [Safety] 确保 global_settings 有合理的值
+    if (strlen(global_settings.singbox_path) == 0) {
+        ConfigSafeStrCpy(global_settings.singbox_path, sizeof(global_settings.singbox_path), "sing-box.exe");
+    }
+    global_settings.local_port = g_localPort; // 再次同步，确保一致
 
     // 应用订阅列表
     g_subCount = subCount;
@@ -399,8 +422,12 @@ void SaveSettings() {
     
     // JSON 相关快照
     char s_localAddr[64]; memcpy(s_localAddr, g_localAddr, sizeof(s_localAddr));
-    int s_localPort = g_localPort;
+    int s_localPort = g_localPort; // 使用 g_localPort，因为它在 gui_settings 中被更新
     wchar_t s_currentNode[256]; wcscpy_s(s_currentNode, 256, currentNode);
+    
+    // [New] Sing-box 路径快照
+    char s_sbPath[512]; 
+    ConfigSafeStrCpy(s_sbPath, sizeof(s_sbPath), global_settings.singbox_path);
 
     // 订阅相关快照
     long long s_lastUpdate = g_lastUpdateTime;
@@ -462,8 +489,8 @@ void SaveSettings() {
 
     WritePrivateProfileStringW(L"Settings", L"LastNode", NULL, g_iniFilePath);
     
-    // 写入 config.json
-    WriteJsonConfig(s_localAddr, s_localPort, s_currentNode);
+    // 写入 config.json (带 singbox_path)
+    WriteJsonConfig(s_localAddr, s_localPort, s_currentNode, s_sbPath);
     
     // 写入订阅
     WritePrivateProfileStringW(L"Subscriptions", NULL, NULL, g_iniFilePath); 
