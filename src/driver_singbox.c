@@ -1,11 +1,15 @@
+/* src/driver_singbox.c */
+// [Fix] 调整头文件顺序：winsock2.h 必须在 windows.h 之前
+
+#include <winsock2.h>
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "cJSON.h"
 #include "driver_singbox.h"
-#include "config.h"  // 假设 node_t 和 program_settings_t 在此处定义
-#include "utils.h"   // 假设包含常规工具函数
+#include "config.h" 
+#include "utils.h"
 
 static PROCESS_INFORMATION g_pi = { 0 };
 static int g_is_running = 0;
@@ -61,14 +65,10 @@ static cJSON* build_outbound_node(const node_t *node) {
     cJSON_AddStringToObject(out, "tag", "proxy");
     
     // === 基础字段映射 ===
-    // 注意：请根据实际 node_t 结构体成员名称调整以下字段
     cJSON_AddStringToObject(out, "server", node->address);
     cJSON_AddNumberToObject(out, "server_port", node->port);
     
     // === 协议适配 ===
-    // 假设 node->type 枚举值: 1=VMess, 2=VLESS, 3=Shadowsocks, 4=Trojan
-    // 注意：这里的判断逻辑需根据 MandaleECH 实际定义的协议常量进行调整
-    
     if (node->type == 1) { // VMess
         cJSON_AddStringToObject(out, "type", "vmess");
         cJSON_AddStringToObject(out, "uuid", node->uuid);
@@ -91,33 +91,30 @@ static cJSON* build_outbound_node(const node_t *node) {
     else if (node->type == 2) { // VLESS
         cJSON_AddStringToObject(out, "type", "vless");
         cJSON_AddStringToObject(out, "uuid", node->uuid);
-        // VLESS Flow (如有)
         if (node->flow && strlen(node->flow) > 0) {
              cJSON_AddStringToObject(out, "flow", node->flow);
         }
     }
     else if (node->type == 3) { // Shadowsocks
         cJSON_AddStringToObject(out, "type", "shadowsocks");
-        cJSON_AddStringToObject(out, "method", node->security); // 加密方式 e.g. aes-256-gcm
-        cJSON_AddStringToObject(out, "password", node->uuid);   // 复用 uuid 字段存密码
+        cJSON_AddStringToObject(out, "method", node->security); 
+        cJSON_AddStringToObject(out, "password", node->uuid);   
     }
     else if (node->type == 4) { // Trojan
         cJSON_AddStringToObject(out, "type", "trojan");
         cJSON_AddStringToObject(out, "password", node->uuid);
     }
     else {
-        // 未知协议默认 Direct，防止配置错误导致启动失败
         cJSON_AddStringToObject(out, "type", "direct");
     }
 
     // === TLS 配置 (通用) ===
-    // 假设 node->tls 为 1 表示开启 TLS
     if (node->tls == 1) {
         cJSON *tls = cJSON_CreateObject();
         cJSON_AddBoolToObject(tls, "enabled", 1);
         cJSON_AddStringToObject(tls, "server_name", strlen(node->host) > 0 ? node->host : node->address);
-        cJSON_AddBoolToObject(tls, "insecure", 1); // 允许不安全证书，生产环境可改为0
-        cJSON_AddStringToObject(tls, "utls", "enabled"); // 启用 uTLS 指纹模拟
+        cJSON_AddBoolToObject(tls, "insecure", 1); 
+        cJSON_AddStringToObject(tls, "utls", "enabled"); 
         cJSON_AddStringToObject(tls, "fingerprint", "chrome");
         cJSON_AddItemToObject(out, "tls", tls);
     }
@@ -136,13 +133,11 @@ static int generate_config_file(const node_t *node, const program_settings_t *se
     cJSON *outbounds = cJSON_CreateArray();
     cJSON_AddItemToArray(outbounds, build_outbound_node(node));
     
-    // 添加直连出口
     cJSON *direct = cJSON_CreateObject();
     cJSON_AddStringToObject(direct, "type", "direct");
     cJSON_AddStringToObject(direct, "tag", "direct");
     cJSON_AddItemToArray(outbounds, direct);
     
-    // 添加阻止出口
     cJSON *block = cJSON_CreateObject();
     cJSON_AddStringToObject(block, "type", "block");
     cJSON_AddStringToObject(block, "tag", "block");
@@ -150,7 +145,6 @@ static int generate_config_file(const node_t *node, const program_settings_t *se
     
     cJSON_AddItemToObject(root, "outbounds", outbounds);
     
-    // 简单的路由规则
     cJSON *route = cJSON_CreateObject();
     cJSON_AddBoolToObject(route, "auto_detect_interface", 1);
     cJSON_AddItemToObject(root, "route", route);
@@ -182,9 +176,8 @@ void singbox_init(void) {
 
 void singbox_stop(void) {
     if (g_is_running && g_pi.hProcess) {
-        // 尝试优雅关闭，但在 Windows 上 Terminate 最直接
         TerminateProcess(g_pi.hProcess, 0);
-        WaitForSingleObject(g_pi.hProcess, 1000); // 等待最多1秒
+        WaitForSingleObject(g_pi.hProcess, 1000); 
         CloseHandle(g_pi.hProcess);
         CloseHandle(g_pi.hThread);
         memset(&g_pi, 0, sizeof(g_pi));
@@ -193,38 +186,31 @@ void singbox_stop(void) {
 }
 
 int singbox_start(const node_t *node, const program_settings_t *settings) {
-    singbox_stop(); // 启动前先停止旧进程
+    singbox_stop(); 
 
     if (!node) {
         return -1;
     }
     
-    // 假设 settings->singbox_path 存储了可执行文件路径
-    // 如果为空，使用默认文件名
     const char *exe_path = (strlen(settings->singbox_path) > 0) ? settings->singbox_path : "sing-box.exe";
 
-    // 1. 生成配置文件
     if (!generate_config_file(node, settings)) {
-        return -2; // Config 写入失败
+        return -2; 
     }
 
-    // 2. 启动进程
     STARTUPINFOA si = { 0 };
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE; // 隐藏控制台窗口
+    si.wShowWindow = SW_HIDE; 
 
     char cmd[2048];
-    // 命令格式: "path/to/sing-box.exe" run -c config.json
     snprintf(cmd, sizeof(cmd), "\"%s\" run -c config.json", exe_path);
 
-    // 尝试创建进程
     if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &g_pi)) {
         g_is_running = 1;
         return 0;
     }
 
-    // 启动失败
     g_is_running = 0;
     return -3; 
 }
@@ -239,7 +225,6 @@ int singbox_is_running(void) {
         }
     }
     
-    // 如果进程已退出，更新状态
     g_is_running = 0;
     if (g_pi.hProcess) {
         CloseHandle(g_pi.hProcess);
