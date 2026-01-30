@@ -3,9 +3,11 @@
 // 1. 移除 g_total_allocated_mem 定义 (已在 proxy_utils.c 中定义)
 // 2. 增加 g_localAddr 定义
 // [Mod] 2026: 增加 g_needReloadRoutes 全局变量
+// [Refactor] 2026: 增加 Sing-box 驱动所需的全局变量定义
 
 #include "common.h"
 #include "proxy.h"
+#include "config.h" // [New] 引入配置头文件以支持 program_settings_t
 
 // --- 全局配置变量 ---
 ProxyConfig g_proxyConfig = {0};
@@ -13,6 +15,16 @@ volatile BOOL g_proxyRunning = FALSE;
 
 // [Fix] 定义本地监听地址 (之前缺失导致 undefined reference)
 char g_localAddr[64] = "127.0.0.1";
+
+// [New] Sing-box 驱动层全局设置
+program_settings_t global_settings = {
+    .local_port = 1080,
+    .allow_lan = 0,
+    .singbox_path = "sing-box.exe" // 默认路径
+};
+
+// [New] 当前选中的节点详情 (供驱动生成配置使用)
+node_t g_currentNode = {0};
 
 // --- 网络资源 ---
 SOCKET g_listen_sock = INVALID_SOCKET;
@@ -31,7 +43,7 @@ HFONT hAppFont = NULL;
 // --- 节点管理 ---
 wchar_t** nodeTags = NULL;
 int nodeCount = 0;
-wchar_t currentNode[256] = {0};
+wchar_t currentNode[256] = {0}; // [Legacy] 仅用于 GUI 记录选中节点的 Tag
 wchar_t g_editingTag[256] = {0};
 
 // --- 系统与状态 ---
