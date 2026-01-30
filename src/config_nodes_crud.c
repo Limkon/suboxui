@@ -6,12 +6,90 @@
 #include "utils.h"
 #include "proxy.h" 
 #include "common.h"
-#include "crypto.h"  // [Fix] 添加此行以支持 ReloadSSLContext
+#include "crypto.h" 
 #include "config_nodes_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h> 
+
+// [New] 引入 Sing-box 驱动需要的节点结构体转换逻辑
+static void _ParseJsonToNodeStruct(cJSON *item, node_t *node) {
+    if (!item || !node) return;
+    memset(node, 0, sizeof(node_t));
+    node->id = (int)GetTickCount(); // 使用时间戳作为 ID 触发更新
+    if (node->id == 0) node->id = 1;
+
+    cJSON *addr = cJSON_GetObjectItem(item, "add");
+    if (addr && addr->valuestring) strncpy(node->address, addr->valuestring, sizeof(node->address)-1);
+    
+    cJSON *port = cJSON_GetObjectItem(item, "port");
+    if (port) {
+        if (cJSON_IsNumber(port)) node->port = port->valueint;
+        else if (cJSON_IsString(port)) node->port = atoi(port->valuestring);
+    }
+    
+    // 协议类型推断
+    cJSON *protocol = cJSON_GetObjectItem(item, "protocol");
+    char protoStr[32] = {0};
+    if (protocol && protocol->valuestring) strncpy(protoStr, protocol->valuestring, 31);
+    
+    // 兼容 V2RayN 格式
+    if (strlen(protoStr) == 0) {
+        if (cJSON_GetObjectItem(item, "id")) strcpy(protoStr, "vmess");
+        else if (cJSON_GetObjectItem(item, "password")) strcpy(protoStr, "shadowsocks");
+    }
+
+    if (strcasecmp(protoStr, "vmess") == 0) node->type = 1;
+    else if (strcasecmp(protoStr, "vless") == 0) node->type = 2;
+    else if (strcasecmp(protoStr, "shadowsocks") == 0) node->type = 3;
+    else if (strcasecmp(protoStr, "trojan") == 0) node->type = 4;
+    else node->type = 1; // Default
+
+    // UUID / Password
+    cJSON *id = cJSON_GetObjectItem(item, "id");
+    if (id && id->valuestring) strncpy(node->uuid, id->valuestring, sizeof(node->uuid)-1);
+    else {
+        cJSON *pwd = cJSON_GetObjectItem(item, "password");
+        if (pwd && pwd->valuestring) strncpy(node->uuid, pwd->valuestring, sizeof(node->uuid)-1);
+    }
+
+    // Network
+    cJSON *net = cJSON_GetObjectItem(item, "net");
+    char netStr[32] = {0};
+    if (net && net->valuestring) strncpy(netStr, net->valuestring, 31);
+    if (strcasecmp(netStr, "ws") == 0) node->net_type = 1;
+    else node->net_type = 0; // TCP
+    
+    // Path & Host
+    cJSON *path = cJSON_GetObjectItem(item, "path");
+    if (path && path->valuestring) strncpy(node->path, path->valuestring, sizeof(node->path)-1);
+    
+    cJSON *host = cJSON_GetObjectItem(item, "host");
+    if (host && host->valuestring) strncpy(node->host, host->valuestring, sizeof(node->host)-1);
+    else {
+        cJSON *sni = cJSON_GetObjectItem(item, "sni");
+        if (sni && sni->valuestring) strncpy(node->host, sni->valuestring, sizeof(node->host)-1);
+    }
+
+    // TLS
+    cJSON *tls = cJSON_GetObjectItem(item, "tls");
+    if (tls && tls->valuestring && strlen(tls->valuestring) > 0 && strcasecmp(tls->valuestring, "none") != 0) {
+        node->tls = 1;
+    } else {
+        node->tls = 0;
+    }
+
+    // Security & Flow
+    cJSON *scy = cJSON_GetObjectItem(item, "scy");
+    if (!scy) scy = cJSON_GetObjectItem(item, "security");
+    if (!scy) scy = cJSON_GetObjectItem(item, "method");
+    if (scy && scy->valuestring) strncpy(node->security, scy->valuestring, sizeof(node->security)-1);
+    else strcpy(node->security, "auto");
+    
+    cJSON *flow = cJSON_GetObjectItem(item, "flow");
+    if (flow && flow->valuestring) strncpy(node->flow, flow->valuestring, sizeof(node->flow)-1);
+}
 
 // [Helper] 获取唯一标签名 (去掉 static 以便在 Manage 模块中使用)
 char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name) {
@@ -44,15 +122,13 @@ char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name
         }
         
         if (!exists) break;
-        
-        // [Safety] 防止无限循环
         if (index > 10000) break;
         index++;
     }
     return final_tag;
 }
 
-// [Mod] 切换节点逻辑更新：保存配置到 JSON 而不是 INI
+// [Mod] 切换节点逻辑更新：保存配置到 JSON 并填充 g_currentNode
 void SwitchNode(const wchar_t* tag) {
     if (!tag) return;
     
@@ -61,7 +137,7 @@ void SwitchNode(const wchar_t* tag) {
 
     EnterCriticalSection(&g_configLock);
     
-    // 1. 更新内存状态
+    // 1. 更新内存状态 (GUI用)
     wcsncpy(currentNode, tag, 255);
     currentNode[255] = L'\0';
 
@@ -94,30 +170,20 @@ void SwitchNode(const wchar_t* tag) {
     }
     
     if (targetNode) {
-        ParseNodeConfigToGlobal(targetNode);
+        // [New] 填充全局节点结构体，供 Sing-box 驱动使用
+        _ParseJsonToNodeStruct(targetNode, &g_currentNode);
         log_msg("[System] 节点配置已更新: %s", tagUtf8);
 
         // 3. 必须先释放锁，因为 SaveSettings 内部也会获取该锁
         LeaveCriticalSection(&g_configLock); 
         
-        if (g_proxyRunning) {
-            StopProxyCore();
-        }
+        // 注意：原有的 StopProxyCore/StartProxyCore 调用可能不再适用，
+        // 因为现在 proxy.c 中的 ProxyMonitorThread 会自动检测 ID 变更并重启。
+        // 但为了兼容性，我们保留它们，因为 StartProxyCore 现在只是启动监控线程。
         
-        EnterCriticalSection(&g_configLock);
-        ReloadSSLContext();
-        LeaveCriticalSection(&g_configLock);
-        
-        StartProxyCore(); 
-        
-        // [New] 调用全局保存函数，同步选中节点到 config.json
+        // SaveSettings 会保存 selected_node 到 json
         SaveSettings();   
         
-     // wchar_t tip[128];
-     // _snwprintf(tip, 128, L"节点已切换: %.60s", tag);
-     // wcsncpy(nid.szInfo, tip, 127);
-     // nid.uFlags |= NIF_INFO;
-     // Shell_NotifyIconW(NIM_MODIFY, &nid);
     } else {
         log_msg("[Err] 未在配置中找到节点: %s", tagUtf8);
         LeaveCriticalSection(&g_configLock);
@@ -163,8 +229,6 @@ void DeleteNode(const wchar_t* tag) {
     cJSON_Delete(root);
     
     LeaveCriticalSection(&g_configLock);
-    
-    // 更新内存中的 tag 列表
     ParseTags(); 
 }
 
@@ -200,11 +264,9 @@ void ToggleNodePin(const wchar_t* tag) {
         }
     }
     LeaveCriticalSection(&g_configLock);
-    
     ParseTags();
 }
 
-// [Refactor] 将指定节点置顶
 void SetNodeToTop(const wchar_t* tag) {
     if (!tag) return;
     char tagUtf8[256];
@@ -243,10 +305,8 @@ void SetNodeToTop(const wchar_t* tag) {
             cJSON* targetNode = cJSON_DetachItemFromArray(outbounds, targetIdx);
             if (targetNode) {
                 cJSON_InsertItemInArray(outbounds, 0, targetNode);
-                
                 cJSON* pin = cJSON_GetObjectItem(targetNode, "is_pinned");
                 if (!pin) cJSON_AddBoolToObject(targetNode, "is_pinned", cJSON_True);
-                
                 char* out = cJSON_Print(root);
                 WriteBufferToFile(CONFIG_FILE, out);
                 free(out);
@@ -255,7 +315,6 @@ void SetNodeToTop(const wchar_t* tag) {
     }
     cJSON_Delete(root);
     LeaveCriticalSection(&g_configLock);
-    
     ParseTags();
 }
 
@@ -296,11 +355,9 @@ BOOL AddNodeToConfig(cJSON* newNode) {
     free(out); cJSON_Delete(root);
     
     LeaveCriticalSection(&g_configLock);
-    
     return ret;
 }
 
-// 更新节点测速结果到配置文件
 void UpdateNodeLatency(const wchar_t* tag, int latency) {
     if (!tag) return;
     char tagUtf8[512];
@@ -318,7 +375,6 @@ void UpdateNodeLatency(const wchar_t* tag, int latency) {
             cJSON_ArrayForEach(node, outbounds) {
                 cJSON* t = cJSON_GetObjectItem(node, "tag");
                 if (t && t->valuestring && strcmp(t->valuestring, tagUtf8) == 0) {
-                    // 如果已存在 latency 字段则删除，重新添加
                     if (cJSON_GetObjectItem(node, "latency")) {
                         cJSON_DeleteItemFromObject(node, "latency");
                     }
