@@ -161,6 +161,9 @@ set(SOURCES
     src/proxy_loop.c
     src/proxy_h2.c
     
+    # [New] Sing-box 驱动实现
+    src/driver_singbox.c
+    
     src/crypto_core.c
     src/crypto_bio.c
     src/crypto_tls.c
@@ -236,4 +239,3 @@ if(MINGW)
     message(STATUS "  Regex Stack:  ${REGEX_LIBRARY} -> ${TRE_LIBRARY} -> ${INTL_LIBRARY}")
 endif()
 message(STATUS "=========================================")
-
